@@ -1,3 +1,4 @@
+```C
 pp
 pguo      81877      1  0 Mar30 pts/5    00:00:00 /data2/github/postgres/install/bin/postgres -D ../data
 pguo      81879  81877  0 Mar30 ?        00:00:00 postgres: checkpointer process
@@ -52,31 +53,30 @@ Breakpoint 1, PortalRun (portal=0xdef310, count=9223372036854775807, isTopLevel=
 ) at postmaster.c:1309
 #7  0x000000000046bbc0 in main (argc=3, argv=0xdcfce0) at main.c:228
 (gdb)
+```
+
 总结:
+- Postmaster fork a new backend process in BackendStartup() after psl connection.
 
-Postmaster fork a new backend process in BackendStartup() after psl connection.
+  **优点**：实现逻辑相对简单，更加关注与query本身，因此可以大量使用全局变量。使用进程隔离好：租户安全、资源控制、错误隔离、相对容易debug。
 
-优点：实现逻辑相对简单，更加关注与query本身，因此可以大量使用全局变量。使用进程隔离好：租户安全、资源控制、错误隔离、相对容易debug。
+  **缺点**：大量长连接context switch需求较多。使用nginx/mysql类似的preforked worker process：可以多个query共享一个process（逻辑将会复杂因为要自己记录上下文而非交给内核）。
+  
+  **思考**: 你会用什么方式实现一个数据库？调度交给内核（process）还是语言（e.g. golang scheduler）还是自己（e.g. epoll）？OLTP vs OLAP.
+  
+- Typical call path for a simple query:
+  
+  BackendStartup()-> BackendRun()->PostgresMain()->exec_simple_query()->PortalRun()
+- 注意全局变量：IsUnderPostmaster is true in postmaster child processes
+- libpq:
+ 
+  在连接的时候，包的格式似乎是这个函数：pqBuildStartupPacket3()
 
-缺点：大量长连接context switch需求较多。使用nginx/mysql类似的preforked worker process：可以多个query共享一个process（逻辑将会复杂因为要自己记录上下文而非交给内核）。
-
-思考: 你会用什么方式实现一个数据库？调度交给内核（process）还是语言（e.g. golang scheduler）还是自己（e.g. epoll）？OLTP vs OLAP.
-
-Typical call path for a simple query:
-
-BackendStartup()-> BackendRun()->PostgresMain()->exec_simple_query()->PortalRun()
-
-注意全局变量：IsUnderPostmaster is true in postmaster child processes
-
-libpq:
-
-在连接的时候，包的格式似乎是这个函数：pqBuildStartupPacket3()
-
-在发送query的时候，typically psql calls PQsendQuery()，这种就是所谓的"simple query". payload以'Q'开头。PostgresMain()中发现firstchar为'Q'的时候call into exec_simple_query()处理.
+  在发送query的时候，typically psql calls PQsendQuery()，这种就是所谓的"simple query". payload以'Q'开头。PostgresMain()中发现firstchar为'Q'的时候call into exec_simple_query()处理.
 
 PostgresMain():
-
-switch (firstchar)
+```C
+        switch (firstchar)
         {
             case 'Q':           /* simple query */
                 {
@@ -96,12 +96,18 @@ switch (firstchar)
                     send_ready_for_query = true;
                 }
                 break;
-因此似乎pg9.6上的wal replication是通过libpq。 问题：For replication，似乎是单线程／进程的，需要或者可以多线程/进程提速吗？
+```
+因此似乎pg9.6上的wal replication是通过libpq。
+**问题**：For replication，似乎是单线程／进程的，需要或者可以多线程/进程提速吗？
 
-BackendStartup
-BackendRun
-PostgresMain
-exec_simple_query
+```
+graph TD
+  BackendStartup --> BackendRun
+  BackendRun --> PostgresMain
+  PostgresMain --> exec_simple_query
+```
+
+```C
 /* 只分析主要函数 */
 static void
 exec_simple_query(const char *query_string)
@@ -367,15 +373,19 @@ PortalStrategy
 ChoosePortalStrategy(List *stmts);
 
 注意：相比HAWQ中得代码，这个strategy多了PORTAL_ONE_MOD_WITH，这个似乎是For CTE?
-总结：
+```
 
-transaction (Could set)
+总结：
+- transaction (Could set)
+```
 postgres=# show transaction_isolation;
  transaction_isolation
 -----------------------
  read committed
 (1 row)
-典型的memory context
+```
+- 典型的memory context
+```C
 /*
  * CurrentMemoryContext
  *      Default memory context for allocations.
@@ -396,6 +406,8 @@ MemoryContext CurTransactionContext = NULL;
 
 /* This is a transient link to the active portal's memory context: */
 MemoryContext PortalContext = NULL;
+```
+```C
 void
 PortalStart(Portal portal, ParamListInfo params,
             int eflags, Snapshot snapshot)
@@ -413,6 +425,8 @@ PortalStart(Portal portal, ParamListInfo params,
         /* */
                 ExecutorStart(queryDesc, myeflags);
 }
+```
+```C
 typedef struct QueryDesc {
     ......
     /* These fields are set by ExecutorStart */
@@ -472,8 +486,10 @@ typedef struct HashJoinState
     ......
 }
 /* PlanState是一个基类 */
-pg允许通过hook实现不同的执行器
 
+```
+**pg允许通过hook实现不同的执行器**
+```C
 void
 ExecutorStart(QueryDesc *queryDesc, int eflags)
 {
@@ -482,41 +498,50 @@ ExecutorStart(QueryDesc *queryDesc, int eflags)
     else
         standard_ExecutorStart(queryDesc, eflags);
 }
-典型的executor函数
+```
+**典型的executor函数**
 
 ExecutorStart(QueryDesc *queryDesc, int eflags)
 
-->standard_ExecutorStart()
+    ->standard_ExecutorStart()
 
-    ->Populate Estate
+        ->Populate Estate
 
-    ->InitPlan
+        ->InitPlan
 
-        ->ExecInitNode
+            ->ExecInitNode
+        
 ExecutorRun(QueryDesc *queryDesc, ScanDirection direction, uint64 count)
 
-->standard_ExecutorRun()
+    ->standard_ExecutorRun()
 
-    ->ExecutePlan()
+        ->ExecutePlan()
 
-        ->Loop { ExecProcNode(): 得到一个tuple，returns TupleTableSlot* }
+            ->Loop { ExecProcNode(): 得到一个tuple，returns TupleTableSlot* }
+
 ExecutorEnd(QueryDesc *queryDesc)
 
-->standard_ExecutorEnd()
+    ->standard_ExecutorEnd()
 
-    ->ExecEndPlan()
+        ->ExecEndPlan()
 
-        ->Recursively calls ExecEndNode()
-ExecProcNode() /* Recursively calls if needed. e.g. For AppendState, calls it for each subnode. */
+            ->Recursively calls ExecEndNode()
 
--> ExecSeqScan() /* for seqscan */
-    -> ExecScan()
-        -> SeqNext()
-Exercise
+ExecProcNode()  /* Recursively calls if needed. e.g. For AppendState, calls it for each subnode. */
 
-一次只有一个tuple -> bulk fetch (and then combine with abundent SSE* instructions, i.e. SIMD). Should benifit performance.
-Add an operator, or for a simple external storage protocol which is friendly for db operations, typical redis, for example.
+    -> ExecSeqScan() /* for seqscan */
+        -> ExecScan()
+            -> SeqNext()
+
+***
+
+
+
+==**Exercise**==
+- 一次只有一个tuple -> bulk fetch (and then combine with abundent SSE* instructions, i.e. SIMD).
+  Should benifit performance.
+- Add an operator, or for a simple external storage protocol which is friendly for db operations, typical redis, for example.
+
 Misc
-
-column vs row.
+- column vs row.
 
